@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<!--
+  ╔══════════════════════════════════════════════════════════════════════╗
+  ║  TARS FRODOBOT DASHBOARD  –  v2.0  –  2026-03-05                   ║
+  ║  FrodoBot EarthRover dashboard s TARS VISION overlay                ║
+  ║                                                                      ║
+  ║  ARCHITEKTÚRA:                                                       ║
+  ║  ┌─────────────┐    Agora RTC     ┌──────────┐                      ║
+  ║  │  dashboard  │◄─────────────────│  FrodoBot│  (video stream)      ║
+  ║  │  (browser)  │──RTM peer msg───►│  SDK     │  (ovládanie)         ║
+  ║  └─────────────┘                  └──────────┘                      ║
+  ║         │  JPEG frame (každých 120ms)                                ║
+  ║         ▼                                                            ║
+  ║  ┌──────────────────────┐                                            ║
+  ║  │  NVIDIA DGX Spark    │  YOLO11x + ByteTrack + LLaVA              ║
+  ║  │  10.168.127.220:8010 │  ~100-150 FPS inference                   ║
+  ║  └──────────────────────┘                                            ║
+  ║         │  JSON: [{id, label, description, conf, x,y,w,h, trend}]   ║
+  ║         ▼                                                            ║
+  ║  <canvas> overlay → farebné rámčeky + labely + LLaVA popis          ║
+  ║                                                                      ║
+  ║  VIDEO:     Agora WebRTC  – UID 1000 = predná, 1001 = zadná         ║
+  ║  CONTROL:   Agora RTM SDK priamo v browseri (nie browser_service)   ║
+  ║  TELEMETRIA: RTM MessageFromPeer (binary) → updateTelemetryFromRTM  ║
+  ║  VISION:    kláves V – zapne/vypne TARS VISION canvas overlay       ║
+  ║                                                                      ║
+  ║  SPUSTENIE SDK:                                                      ║
+  ║    cd ~/earth-rovers-sdk                                             ║
+  ║    source ~/frodoenv/bin/activate                                    ║
+  ║    python -m uvicorn main:app --port 8001                            ║
+  ║    → http://localhost:8001/dashboard                                 ║
+  ╚══════════════════════════════════════════════════════════════════════╝
+-->
+<html lang="sk">
+<head>
+<meta charset="UTF-8">
+<title>FrodoBot Dashboard</title>
+<style>
+/* ── RESET + ZÁKLADNÝ LAYOUT ── */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #0d0d0d; color: #e0e0e0;
+  font-family: 'Courier New', monospace;
+  height: 100vh; display: grid;
+  /* 3 riadky: topbar (44px) | hlavná oblasť (zvyšok) | bottombar (36px) */
+  grid-template-rows: 44px 1fr 36px;
+  overflow: hidden;
+  user-select: none; /* zabrání označovaniu textu pri rýchlom kliknutí */
+}
+
+/* ── TOP BAR – stavové indikátory ── */
+#topbar {
+  background: #111; border-bottom: 1px solid #1e1e1e;
+  display: flex; align-items: center;
+  padding: 0 14px; gap: 20px;
+}
+#topbar h1 { font-size: 13px; color: #4af; letter-spacing: 3px; margin-right: 8px; }
+.stat { display: flex; align-items: center; gap: 5px; font-size: 11px; }
+.sl { color: #555; }                    /* stat label */
+.sv { color: #4af; font-weight: bold; min-width: 36px; }  /* stat value */
+.sv.ok   { color: #4f8; }              /* zelená = OK  */
+.sv.warn { color: #fa4; }              /* oranžová = varovanie */
+.sv.err  { color: #f44; }             /* červená = chyba */
+
+/* Agora RTC connection dot – bliká keď je pripojený */
+#conn-dot { width: 7px; height: 7px; border-radius: 50%; background: #f44; }
+#conn-dot.ok { background: #4f8; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+/* Signal strength bars (5 stĺpcov, rôzne výšky) */
+.sig-bars { display:flex; align-items:flex-end; gap:2px; height:14px; }
+.sig-bar { width:4px; background:#2a2a2a; border-radius:1px; }
+.sig-bar.on { background:#4af; }       /* aktívny bar = nastavená rýchlosť */
+
+/* Aktuálna nastavená max-rýchlosť (vpravo v topbare) */
+#speed-cur { margin-left: auto; font-size: 12px; color: #fa4; letter-spacing: 1px; }
+
+/* ── HLAVNÁ OBLASŤ – 2 stĺpce: kamery | panel ── */
+#main {
+  display: grid; grid-template-columns: 1fr 280px;
+  gap: 6px; padding: 6px; min-height: 0;
+}
+
+/* ── KAMERY – predná (3x) + zadná (1x) ── */
+#cams { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.cambox {
+  position: relative; background: #0a0a0a;
+  border: 1px solid #1a1a1a; border-radius: 3px;
+  overflow: hidden; display: flex;
+  align-items: center; justify-content: center;
+  min-height: 0;
+}
+#cambox-front { flex: 3; }             /* predná kamera – 3/4 výšky */
+#cambox-rear  { flex: 1; }             /* zadná kamera  – 1/4 výšky */
+
+/* Agora WebRTC inject-uje <video> do divov front-video / rear-video */
+.cambox > div[id$="-video"] { width: 100%; height: 100%; }
+.cambox video { width: 100% !important; height: 100% !important; object-fit: cover !important; }
+
+/* Overlay etikety na kamerách */
+.cam-tag {
+  position: absolute; top: 6px; left: 8px;
+  font-size: 9px; letter-spacing: 2px; color: #fff;
+  background: rgba(0,0,0,.55); padding: 2px 6px; border-radius: 2px;
+}
+.cam-nosig {
+  position: absolute; font-size: 11px; color: #333; letter-spacing: 2px;
+}
+/* Spodný gradient overlay s live telemetriou na prednej kamere */
+.cam-overlay {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: linear-gradient(transparent, rgba(0,0,0,.7));
+  padding: 6px 8px; display: flex; gap: 10px; align-items: center;
+}
+.cam-stat { font-size: 10px; color: #888; }
+.cam-stat span { color: #4af; }
+
+/* ── PRAVÝ PANEL – rýchlosť, telemetria, ovládanie ── */
+#panel { display: flex; flex-direction: column; gap: 6px; min-height: 0; overflow-y: auto; }
+.card {
+  background: #111; border: 1px solid #1a1a1a;
+  border-radius: 3px; padding: 10px 12px; flex-shrink: 0;
+}
+.card-title { font-size: 9px; color: #444; letter-spacing: 2px; margin-bottom: 8px; text-transform: uppercase; }
+
+/* Speed slider – vizuálny bar pre nastavenú max-rýchlosť
+   Rozsah: 0.05 (min) – 0.50 (max), default 0.20
+   Farba: modrá (pomalá) → oranžová → červená (rýchla) */
+.spd-track { background: #1a1a1a; border-radius: 3px; height: 6px; margin: 6px 0 3px; position: relative; }
+.spd-fill { height: 100%; border-radius: 3px; background: #4af; transition: width .15s, background .15s; }
+.spd-labels { display: flex; justify-content: space-between; font-size: 9px; color: #333; }
+
+/* Telemetria – riadky kľúč:hodnota */
+.tr { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; border-bottom: 1px solid #161616; }
+.tr:last-child { border: none; }
+.tk { color: #555; }
+.tv { color: #4af; font-weight: bold; }
+
+/* Battery fill bar – farba podľa úrovne: >30% zelená, >15% oranžová, inak červená */
+.bat-wrap { background: #161616; border-radius: 2px; height: 4px; margin-top: 5px; }
+.bat-fill { height: 100%; border-radius: 2px; background: #4f8; transition: width .5s, background .5s; }
+
+/* Klávesové skratky – mriežka 2 stĺpce */
+.key-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 8px; }
+.ki { display: flex; align-items: center; gap: 5px; font-size: 10px; }
+kbd {
+  background: #1c1c1c; border: 1px solid #2a2a2a; border-radius: 2px;
+  padding: 1px 5px; font-size: 9px; color: #4af; font-family: inherit;
+  min-width: 22px; text-align: center;
+}
+.kd { color: #555; }
+
+/* Aktívne klávesy – live badges keď sú stlačené */
+#active-keys { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; min-height: 18px; }
+.akb { background: #4af; color: #000; font-size: 9px; padding: 1px 6px; border-radius: 2px; font-weight: bold; }
+
+/* ── BOTTOM BAR – stav pohybu + lampa + Agora status + fokus ── */
+#bottom {
+  background: #111; border-top: 1px solid #1a1a1a;
+  display: flex; align-items: center; padding: 0 14px;
+  gap: 14px; font-size: 10px;
+}
+#status       { color: #4f8; flex: 1; letter-spacing: 1px; }
+#status.moving  { color: #4af; }
+#status.stopped { color: #f44; font-weight: bold; }
+#lamp-ind     { color: #555; }
+#lamp-ind.on  { color: #ff0; }
+#connect-status { color: #555; }
+
+/* ── TARS VISION – canvas overlay + status panel ── */
+#vision-canvas {
+  position: absolute; top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none; z-index: 10;
+}
+#vision-status {
+  position: absolute; top: 6px; right: 8px;
+  background: rgba(0,0,0,.75); border: 1px solid #1e1e1e;
+  border-radius: 3px; padding: 3px 8px;
+  font-size: 9px; letter-spacing: 1px; z-index: 11;
+  display: flex; gap: 8px; align-items: center;
+}
+#vision-dot { width: 6px; height: 6px; border-radius: 50%; background: #333; flex-shrink:0; }
+#vision-dot.on  { background: #4f8; animation: pulse 1.5s infinite; }
+#vision-dot.err { background: #f44; }
+#vision-fps { color: #4af; min-width:28px; }
+#vision-inf { color: #555; }
+#vision-label { color: #444; }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════
+     TOP BAR  –  RTC stav | BAT | SIG | SPD | VIB | max-rýchlosť
+     ══════════════════════════════════════════ -->
+<div id="topbar">
+  <h1>⬡ FRODOBOT</h1>
+
+  <!-- Agora RTC connection status (dot + text) -->
+  <div class="stat">
+    <div id="conn-dot"></div>
+    <span class="sl">RTC</span>
+    <span id="conn-v" class="sv">—</span>
+  </div>
+
+  <!-- Batéria z telemetrie (RTM) -->
+  <div class="stat">
+    <span class="sl">BAT</span>
+    <span id="bat-v" class="sv">—</span>
+  </div>
+
+  <!-- WiFi signal level (0–5 bars) -->
+  <div class="stat">
+    <span class="sl">SIG</span>
+    <div class="sig-bars" id="sig-bars">
+      <div class="sig-bar" style="height:3px"></div>
+      <div class="sig-bar" style="height:5px"></div>
+      <div class="sig-bar" style="height:8px"></div>
+      <div class="sig-bar" style="height:11px"></div>
+      <div class="sig-bar" style="height:14px"></div>
+    </div>
+  </div>
+
+  <!-- Aktuálna rýchlosť bota (m/s) z telemetrie -->
+  <div class="stat"><span class="sl">SPD</span><span id="spd-v" class="sv">0.00</span></div>
+
+  <!-- Vibrácia bota z telemetrie -->
+  <div class="stat"><span class="sl">VIB</span><span id="vib-v" class="sv">0</span></div>
+
+  <!-- Nastavená max-rýchlosť ovládania (mení sa +/-) -->
+  <div id="speed-cur">MAX <span id="spd-set">0.20</span></div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     HLAVNÁ OBLASŤ  –  kamery (ľavá strana) | panel (pravá strana)
+     ══════════════════════════════════════════ -->
+<div id="main">
+
+  <!-- KAMERY -->
+  <div id="cams">
+
+    <!-- Predná kamera – Agora RTC UID 1000 -->
+    <div class="cambox" id="cambox-front">
+      <div id="front-video"></div>               <!-- Agora inject-uje <video> sem -->
+      <div class="cam-nosig" id="front-nosig">NO SIGNAL</div>
+      <div class="cam-tag">FRONT</div>
+
+      <!-- TARS VISION: canvas overlay pre bbox rámčeky -->
+      <canvas id="vision-canvas"></canvas>
+
+      <!-- TARS VISION: status panel (vpravo hore na kamere) -->
+      <div id="vision-status">
+        <div id="vision-dot"></div>
+        <span id="vision-label">VISION OFF</span>
+        <span id="vision-fps"></span>
+        <span id="vision-inf"></span>
+      </div>
+
+      <!-- Overlay s live hodnotami z telemetrie -->
+      <div class="cam-overlay">
+        <div class="cam-stat">BAT <span id="ol-bat">—</span>%</div>
+        <div class="cam-stat">SIG <span id="ol-sig">—</span></div>
+        <div class="cam-stat">SPD <span id="ol-spd">0.00</span></div>
+      </div>
+    </div>
+
+    <!-- Zadná kamera – Agora RTC UID 1001 -->
+    <div class="cambox" id="cambox-rear">
+      <div id="rear-video"></div>                <!-- Agora inject-uje <video> sem -->
+      <div class="cam-nosig" id="rear-nosig">NO SIGNAL</div>
+      <div class="cam-tag">REAR</div>
+    </div>
+
+  </div>
+
+  <!-- PRAVÝ PANEL -->
+  <div id="panel">
+
+    <!-- Rýchlosť pohybu – slider 0.05–0.50, ovládaný +/- -->
+    <div class="card">
+      <div class="card-title">Rýchlosť pohybu</div>
+      <div class="spd-track">
+        <div class="spd-fill" id="spd-fill" style="width:40%"></div>
+        <!-- šírka = ((speed - 0.05) / 0.45) * 100 % -->
+      </div>
+      <div class="spd-labels">
+        <span>0.05</span>
+        <span id="spd-val-mid">0.20</span>  <!-- aktuálna hodnota uprostred -->
+        <span>0.50</span>
+      </div>
+      <div style="font-size:9px;color:#333;margin-top:4px">+ / − pre zmenu</div>
+    </div>
+
+    <!-- Telemetria – dáta z RTM správ bota, refresh každých 500ms -->
+    <div class="card">
+      <div class="card-title">Telemetria</div>
+      <div class="tr"><span class="tk">Batéria</span>   <span class="tv" id="t-bat">—</span></div>
+      <div class="tr"><span class="tk">Napätie</span>   <span class="tv" id="t-volt">—</span></div>
+      <div class="tr"><span class="tk">Prúd</span>      <span class="tv" id="t-curr">—</span></div>
+      <div class="tr"><span class="tk">Rýchlosť</span>  <span class="tv" id="t-spd">—</span></div>
+      <div class="tr"><span class="tk">Orientácia</span><span class="tv" id="t-ori">—</span></div>
+      <div class="tr"><span class="tk">GPS signál</span><span class="tv" id="t-gps">—</span></div>
+      <div class="tr"><span class="tk">Vibrácia</span>  <span class="tv" id="t-vib">—</span></div>
+      <!-- Battery progress bar -->
+      <div class="bat-wrap"><div class="bat-fill" id="bat-fill" style="width:0%"></div></div>
+    </div>
+
+    <!-- Klávesové skratky + aktívne klávesy live -->
+    <div class="card">
+      <div class="card-title">Klávesové skratky</div>
+      <div class="key-grid">
+        <div class="ki"><kbd>W / ↑</kbd><span class="kd">dopredu</span></div>
+        <div class="ki"><kbd>S / ↓</kbd><span class="kd">dozadu</span></div>
+        <div class="ki"><kbd>A / ←</kbd><span class="kd">vľavo</span></div>
+        <div class="ki"><kbd>D / →</kbd><span class="kd">vpravo</span></div>
+        <div class="ki"><kbd>SPACE</kbd><span class="kd">STOP</span></div>
+        <div class="ki"><kbd>L</kbd><span class="kd">lampa</span></div>
+        <div class="ki"><kbd>+</kbd><span class="kd">rýchlejšie</span></div>
+        <div class="ki"><kbd>−</kbd><span class="kd">pomalšie</span></div>
+        <div class="ki"><kbd>V</kbd><span class="kd">vision on/off</span></div>
+      </div>
+      <!-- Live badges pre momentálne stlačené klávesy -->
+      <div id="active-keys"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     BOTTOM BAR  –  stav pohybu | lampa | Agora | fokus
+     ══════════════════════════════════════════ -->
+<div id="bottom">
+  <span id="status">● PRIPÁJAM SA...</span>
+  <span id="lamp-ind">LAMPA: OFF</span>
+  <span style="color:#2a2a2a">|</span>
+  <span id="connect-status">Agora: čakám...</span>
+  <button id="rtc-retry-btn" onclick="retryRTC()" style="background:#1a1a1a;border:1px solid #333;color:#aaa;font-size:9px;padding:1px 6px;cursor:pointer;display:none">↺ RETRY</button>
+  <span style="color:#2a2a2a">|</span>
+  <!-- Fokus indikátor – klávesnica funguje len keď je stránka fokusovaná -->
+  <span id="focus-hint" style="color:#333; font-size:9px">KLIKNI PRE FOKUS</span>
+</div>
+
+<!-- ══════════════════════════════════════════
+     Agora WebRTC SDK  –  načítaný zo SDK static/
+     Verzia: AgoraRTC_N-4.24.2
+     ══════════════════════════════════════════ -->
+<script src="/static/AgoraRTC_N-4.24.2.js"></script>
+<script src="/static/agora-rtm-sdk-1.6.0.js"></script>
+
+<script>
+// ══════════════════════════════════════════════════════════════════
+//  CREDENTIALS  –  injektované serverom (main.py /dashboard route)
+//  Hodnoty pochádzajú z Frodobots API pri štarte SDK servera
+// ══════════════════════════════════════════════════════════════════
+const APPID       = "{{ appid }}";     // Agora App ID projektu
+const TOKEN       = "{{ rtc_token }}"; // RTC token pre túto session/ride
+const RTM_TOKEN   = "{{ rtm_token }}"; // RTM token pre ovládanie
+const CHANNEL     = "{{ channel }}";   // napr. "ride_bot_frodobot_pkjmes"
+const UID         = Number("{{ uid }}"); // náš user ID v Agora kanáli
+const BOT_RTM_UID = "{{ bot_uid }}";   // UID robota v RTM (napr. frodobot_pkjmes)
+
+// Fixné UID botových kamerastreams v Agora kanáli
+const BOT_UID_FRONT = 1000;  // predná kamera
+const BOT_UID_REAR  = 1001;  // zadná kamera
+
+// ══════════════════════════════════════════════════════════════════
+//  STAV APLIKÁCIE
+// ══════════════════════════════════════════════════════════════════
+let speed = 0.20;             // aktuálna max-rýchlosť (linear), rozsah 0.05–0.50
+let lamp  = 0;                // stav lampy: 0=off, 1=on
+let activeKeys = new Set();   // momentálne stlačené ovládacie klávesy
+let cmdInterval = null;       // interval pre odosielanie príkazov (každých 100ms)
+let rtcConnected = false;     // či je Agora RTC pripojená
+
+// ══════════════════════════════════════════════════════════════════
+//  AGORA RTC  –  video stream z bota (predná + zadná kamera)
+//  Agora WebRTC, mode "rtc", kodek H264
+// ══════════════════════════════════════════════════════════════════
+AgoraRTC.setLogLevel(1); // 1 = debug pre diagnostiku RTC problémov
+const client = AgoraRTC.createClient({ mode: "rtc", codec: "h264" });
+
+async function joinChannel() {
+  setConnStatus("Pripájam...", false);
+  try {
+    // Keď bot začne streamovať kameru
+    client.on("user-published", async (user, mediaType) => {
+      await client.subscribe(user, mediaType);
+      if (mediaType === "video") {
+        const uid = user.uid;
+        if (uid === BOT_UID_FRONT) {
+          user.videoTrack.play("front-video"); // inject <video> do #front-video
+          document.getElementById("front-nosig").style.display = "none";
+        } else if (uid === BOT_UID_REAR) {
+          user.videoTrack.play("rear-video");  // inject <video> do #rear-video
+          document.getElementById("rear-nosig").style.display = "none";
+        }
+      }
+    });
+
+    // Keď bot prestane streamovať
+    client.on("user-unpublished", (user) => {
+      if (user.uid === BOT_UID_FRONT) document.getElementById("front-nosig").style.display = "block";
+      if (user.uid === BOT_UID_REAR)  document.getElementById("rear-nosig").style.display = "block";
+    });
+
+    // Zmena stavu RTC spojenia
+    client.on("connection-state-change", (cur, prev) => {
+      setConnStatus(cur, cur === "CONNECTED");
+      if (cur === "CONNECTED") {
+        rtcConnected = true;
+        setStatus("● PRIPOJENÉ", "");
+      }
+    });
+
+    await client.join(APPID, CHANNEL, TOKEN || null, UID || null);
+    rtcConnected = true;
+    setConnStatus("CONNECTED", true);
+    setStatus("■ STOJÍ", "");
+  } catch(e) {
+    const code = e.code || "";
+    const msg  = e.message || String(e);
+    setConnStatus("ERR: " + msg, false);
+    // Zobraz plnú chybu + retry button
+    const cs = document.getElementById("connect-status");
+    cs.textContent = `Agora ERR [${code}]: ${msg}`;
+    cs.style.color = "#f44";
+    document.getElementById("rtc-retry-btn").style.display = "inline";
+    console.error("Agora join error:", code, msg, e);
+  }
+}
+
+async function retryRTC() {
+  document.getElementById("rtc-retry-btn").style.display = "none";
+  document.getElementById("connect-status").style.color = "";
+  try { await client.leave(); } catch(_) {}
+  await joinChannel();
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  OVLÁDANIE BOTA  –  príkazy cez SDK /control endpoint
+//
+//  Tok príkazu:
+//    fetch POST /control
+//    → main.py: browser_service.send_message(command)
+//    → headless Chrome (pyppeteer) s načítanou /sdk stránkou
+//    → window.sendMessage(json)  [definované v basicRtm.js]
+//    → Agora RTM sendMessageToPeer → botUid (frodobot_pkjmes)
+//    → FrodoBot motor controller
+//
+//  Format: { linear: float, angular: float, lamp: 0|1 }
+//    linear:  +speed = dopredu,  -speed = dozadu,  0 = stoj
+//    angular: +0.4   = vľavo,    -0.4   = vpravo,  0 = rovno
+// ══════════════════════════════════════════════════════════════════
+async function sendCmd(linear, angular) {
+  const msg = JSON.stringify({ linear, angular, lamp });
+  if (rtmChannel) {
+    // Priamy RTM peer message – rovnaký prístup ako rovers.frodobots.com
+    try {
+      await rtmClient.sendMessageToPeer({ text: msg }, BOT_RTM_UID);
+    } catch(e) { console.warn("RTM send failed:", e); }
+  } else {
+    // Fallback na SDK /control endpoint
+    try {
+      await fetch("/control", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ command: { linear, angular, lamp } })
+      });
+    } catch(e) {}
+  }
+}
+
+// Vypočíta linear/angular podľa momentálne stlačených klávesov
+function getCmd() {
+  let lin = 0, ang = 0;
+  if (activeKeys.has("w") || activeKeys.has("ArrowUp"))    lin =  speed; // dopredu
+  if (activeKeys.has("s") || activeKeys.has("ArrowDown"))  lin = -speed; // dozadu
+  if (activeKeys.has("a") || activeKeys.has("ArrowLeft"))  ang =  0.4;   // vľavo
+  if (activeKeys.has("d") || activeKeys.has("ArrowRight")) ang = -0.4;   // vpravo
+  return { lin, ang };
+}
+
+// Hlavná riadiaca slučka – každých 100ms odošle aktuálny príkaz
+// (10 Hz je štandardná frekvencia pre robotické ovládanie)
+cmdInterval = setInterval(() => {
+  const { lin, ang } = getCmd();
+  sendCmd(lin, ang);
+  // Aktualizácia statusu pohybu v bottom bare
+  if (lin > 0)       setStatus("▶ DOPREDU", "moving");
+  else if (lin < 0)  setStatus("◀ DOZADU",  "moving");
+  else if (ang > 0)  setStatus("↺ VĽAVO",   "moving");
+  else if (ang < 0)  setStatus("↻ VPRAVO",  "moving");
+  else if (activeKeys.size === 0) setStatus("■ STOJÍ", "");
+}, 100);
+
+// ══════════════════════════════════════════════════════════════════
+//  KLÁVESNICA
+//  Podporované klávesy:
+//    W/S/A/D + šípky  – pohyb (multi-key = diagonálny pohyb)
+//    SPACE            – núdzové zastavenie
+//    L                – prepnutie lampy
+//    + / =            – zvýšenie rýchlosti o 0.05
+//    - / _            – zníženie rýchlosti o 0.05
+// ══════════════════════════════════════════════════════════════════
+document.addEventListener("keydown", e => {
+  if (e.repeat) return; // ignoruj autorepeat – príkazy idú z intervalu
+  const k = e.key;
+
+  // Zmena rýchlosti (krok 0.05, rozsah 0.05–0.50)
+  if (k === "+" || k === "=") { speed = Math.min(0.5, +(speed+0.05).toFixed(2)); updateSpeedUI(); return; }
+  if (k === "-" || k === "_") { speed = Math.max(0.05, +(speed-0.05).toFixed(2)); updateSpeedUI(); return; }
+
+  // TARS VISION toggle
+  if (k === "v" || k === "V") {
+    visionToggle();
+    if (visionEnabled) requestAnimationFrame(visionAnimFrame);
+    return;
+  }
+
+  // Lampa toggle
+  if (k === "l" || k === "L") {
+    lamp = lamp ? 0 : 1;
+    sendCmd(0, 0); // okamžitý príkaz so zmenenou lampou
+    const el = document.getElementById("lamp-ind");
+    el.textContent = `LAMPA: ${lamp ? "ON" : "OFF"}`;
+    el.className = lamp ? "on" : "";
+    return;
+  }
+
+  // SPACE = núdzové zastavenie – vymaže všetky aktívne klávesy
+  if (k === " ") {
+    e.preventDefault(); // zabrání scrollovaniu stránky
+    activeKeys.clear();
+    sendCmd(0, 0);      // okamžitý stop príkaz
+    setStatus("⛔ STOP", "stopped");
+    updateKeysUI();
+    return;
+  }
+
+  // Pohybové klávesy – pridaj do aktívnej množiny
+  const moves = ["w","s","a","d","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"];
+  if (moves.includes(k)) {
+    e.preventDefault(); // zabrání scrollovaniu pri šípkach
+    activeKeys.add(k);
+    updateKeysUI();
+  }
+});
+
+document.addEventListener("keyup", e => {
+  activeKeys.delete(e.key); // odstráni klávesu z aktívnej množiny
+  updateKeysUI();
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  TELEMETRIA  –  GET /data každých 500ms
+//  Dáta pochádzajú z window.rtm_data v headless Chrome (browser_service)
+//  Bot posiela RTM správy s telemetriou, basicRtm.js ich parsuje
+//  a ukladá do window.rtm_data
+// ══════════════════════════════════════════════════════════════════
+async function fetchTelemetry() {
+  try {
+    const r = await fetch("/data");
+    if (!r.ok) return;
+    const d = await r.json();
+
+    const bat = d.battery ?? 0;
+    const sig = d.signal_level ?? 0;
+    const spd = (d.speed ?? 0).toFixed(2);
+
+    // Top bar
+    document.getElementById("bat-v").textContent = bat + "%";
+    document.getElementById("bat-v").className = "sv " + (bat > 30 ? "ok" : bat > 15 ? "warn" : "err");
+    document.getElementById("spd-v").textContent = spd;
+    document.getElementById("vib-v").textContent = d.vibration ?? 0;
+
+    // Telemetria panel
+    document.getElementById("t-bat").textContent  = bat + "%";
+    document.getElementById("t-volt").textContent = d.voltage  != null ? (d.voltage/10).toFixed(1) + "V" : "—";
+    document.getElementById("t-curr").textContent = d.current  != null ? d.current + "mA" : "—";
+    document.getElementById("t-spd").textContent  = spd;
+    document.getElementById("t-ori").textContent  = (d.orientation ?? "—") + "°";
+    document.getElementById("t-gps").textContent  = d.gps_signal ?? "—";
+    document.getElementById("t-vib").textContent  = d.vibration ?? 0;
+
+    // Camera overlay
+    document.getElementById("ol-bat").textContent = bat;
+    document.getElementById("ol-sig").textContent = sig;
+    document.getElementById("ol-spd").textContent = spd;
+
+    // Battery bar
+    const batFill = document.getElementById("bat-fill");
+    batFill.style.width = bat + "%";
+    batFill.style.background = bat > 30 ? "#4f8" : bat > 15 ? "#fa4" : "#f44";
+
+    // Signal bars (5 bars, lit = počet = signal_level)
+    document.querySelectorAll(".sig-bar").forEach((b, i) => {
+      b.classList.toggle("on", i < sig);
+    });
+  } catch(e) {} // tiché zlyhanie – SDK možno reštartuje
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  UI HELPERS
+// ══════════════════════════════════════════════════════════════════
+
+// Stav pohybu v bottom bare
+function setStatus(msg, cls) {
+  const el = document.getElementById("status");
+  el.textContent = msg; el.className = cls || "";
+}
+
+// Agora RTC connection stav (dot + text + connect-status span)
+function setConnStatus(msg, ok) {
+  const dot = document.getElementById("conn-dot");
+  const val = document.getElementById("conn-v");
+  const cs  = document.getElementById("connect-status");
+  dot.className = ok ? "ok" : "";
+  val.textContent = ok ? "OK" : (msg.length > 6 ? "ERR" : msg);
+  val.className = "sv " + (ok ? "ok" : "err");
+  cs.textContent = "Agora: " + msg;
+}
+
+// Speed slider UI update
+// Prepočet: pct = ((speed - 0.05) / 0.45) * 100
+// Farba:  modrá (≤0.25) → oranžová (≤0.35) → červená (>0.35)
+function updateSpeedUI() {
+  const pct = ((speed - 0.05) / 0.45) * 100;
+  document.getElementById("spd-fill").style.width = pct + "%";
+  document.getElementById("spd-fill").style.background = speed > 0.35 ? "#f44" : speed > 0.25 ? "#fa4" : "#4af";
+  document.getElementById("spd-val-mid").textContent = speed.toFixed(2);
+  document.getElementById("spd-set").textContent = speed.toFixed(2);
+}
+
+// Active keys badges update
+function updateKeysUI() {
+  const el = document.getElementById("active-keys");
+  el.innerHTML = "";
+  activeKeys.forEach(k => {
+    const b = document.createElement("span");
+    b.className = "akb";
+    // Šípky skráť: "ArrowUp" → "Up"
+    b.textContent = k.startsWith("Arrow") ? k.replace("Arrow","") : k.toUpperCase();
+    el.appendChild(b);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  AGORA RTM  –  priame ovládanie bota cez RTM peer messages
+//  Rovnaký prístup ako rovers.frodobots.com (basicRtm.js)
+// ══════════════════════════════════════════════════════════════════
+let rtmClient  = null;
+let rtmChannel = null;
+
+async function joinRTM() {
+  try {
+    rtmClient = AgoraRTM.createInstance(APPID);
+
+    // Príjem telemetrie od robota
+    rtmClient.on("MessageFromPeer", (message, peerId) => {
+      try {
+        const raw = message.rawMessage
+          ? new TextDecoder().decode(message.rawMessage)
+          : message.text;
+        const data = JSON.parse(raw);
+        updateTelemetryFromRTM(data);
+      } catch(e) {}
+    });
+
+    await rtmClient.login({ token: RTM_TOKEN, uid: String(UID) });
+    rtmChannel = rtmClient; // označíme že RTM je ready
+    console.log("RTM login OK, bot UID:", BOT_RTM_UID);
+    document.getElementById("connect-status").textContent = "Agora: CONNECTED + RTM OK";
+  } catch(e) {
+    console.warn("RTM login failed:", e);
+    rtmChannel = null;
+  }
+}
+
+function updateTelemetryFromRTM(d) {
+  if (!d) return;
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  const bat = d.battery ?? 0;
+  const spd = (d.speed ?? 0).toFixed(2);
+  set("bat-v", bat + "%");
+  const batEl = document.getElementById("bat-v");
+  if (batEl) batEl.className = "sv " + (bat > 30 ? "ok" : bat > 15 ? "warn" : "err");
+  set("spd-v", spd);
+  set("vib-v", d.vibration ?? 0);
+  set("t-bat",  bat + "%");
+  set("t-volt", d.voltage  != null ? (d.voltage/10).toFixed(1) + "V" : "—");
+  set("t-curr", d.current  != null ? d.current + "mA" : "—");
+  set("t-spd",  spd);
+  set("t-ori",  d.orientation != null ? d.orientation + "°" : "—");
+  set("t-gps",  d.gps_signal ?? "—");
+  set("t-vib",  d.vibration ?? 0);
+  set("t-lat",  d.latitude  != null && d.latitude  !== 1000 ? d.latitude.toFixed(6)  : "—");
+  set("t-lon",  d.longitude != null && d.longitude !== 1000 ? d.longitude.toFixed(6) : "—");
+  set("t-sig",  d.signal_level ?? "—");
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  INICIALIZÁCIA
+// ══════════════════════════════════════════════════════════════════
+joinChannel();                          // Agora RTC join
+joinRTM();                              // Agora RTM login pre ovládanie
+setInterval(fetchTelemetry, 500);       // Telemetria fallback cez /data
+fetchTelemetry();                       // Prvý fetch okamžite
+
+// KEYBOARD FOCUS FIX
+// document.addEventListener("keydown") funguje len keď má stránka focus.
+// Po otvorení taby v prehliadači focus zostáva na adresnom riadku alebo
+// inej aplikácii. Nastavíme tabindex na body + zavoláme focus().
+// Indikátor v bottom bare informuje o stave fokusu.
+document.body.setAttribute("tabindex", "-1");
+document.body.focus();
+
+document.addEventListener("click", () => {
+  document.body.focus();
+  document.getElementById("focus-hint").style.color = "#4f8";
+  document.getElementById("focus-hint").textContent = "FOKUS OK";
+});
+document.body.addEventListener("focus", () => {
+  document.getElementById("focus-hint").style.color = "#4f8";
+  document.getElementById("focus-hint").textContent = "FOKUS OK";
+});
+document.body.addEventListener("blur", () => {
+  document.getElementById("focus-hint").style.color = "#f44";
+  document.getElementById("focus-hint").textContent = "FOKUS STRATENÝ – KLIKNI";
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  TARS VISION  –  real-time object detection cez YOLO11x na Sparku
+//
+//  Tok:
+//    1. Každých VISION_INTERVAL ms: capture frame z Agora <video>
+//    2. POST JPEG na Spark /detect
+//    3. Spark vráti boxy: [{id, label, description, confidence, x,y,w,h, trend, color}]
+//    4. Canvas overlay nakreslí animované rámčeky s labelmi
+//
+//  trend:
+//    "approaching" → červený pulzujúci border (objekt sa blíži)
+//    "receding"    → modrý slabší border (objekt sa vzďaľuje)
+//    "stable"      → normálny plný border
+//
+//  description: LLaVA:7b popis obsahu každého rámčeka (každé 4s na objekt)
+// ══════════════════════════════════════════════════════════════════
+
+const SPARK_DETECT_URL = "http://10.168.127.220:8010/detect";
+const VISION_INTERVAL  = 120;   // ms medzi frameami (max ~8 FPS detekcie)
+const DESCRIBE_EVERY   = 1;     // každý N-tý request posiela describe=true (LLaVA)
+
+let visionEnabled  = false;
+let visionTimer    = null;
+let visionReqCount = 0;
+
+// Posledné detekované boxy – pre smooth interpoláciu
+let lastBoxes = [];
+let displayBoxes = {};  // id → {box, alpha, pulsePhase}
+
+function visionToggle() {
+  visionEnabled = !visionEnabled;
+  const dot   = document.getElementById("vision-dot");
+  const label = document.getElementById("vision-label");
+  const canvas = document.getElementById("vision-canvas");
+
+  if (visionEnabled) {
+    dot.className = "on";
+    label.textContent = "VISION ON";
+    label.style.color = "#4f8";
+    canvas.style.display = "block";
+    visionLoop();
+  } else {
+    dot.className = "";
+    label.textContent = "VISION OFF";
+    label.style.color = "#444";
+    document.getElementById("vision-fps").textContent = "";
+    document.getElementById("vision-inf").textContent = "";
+    // Vyčisti canvas
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    lastBoxes = [];
+    displayBoxes = {};
+    clearTimeout(visionTimer);
+  }
+}
+
+async function visionLoop() {
+  if (!visionEnabled) return;
+  const t0 = performance.now();
+
+  try {
+    const blob = await captureVideoFrame();
+    if (blob) {
+      visionReqCount++;
+      const describe = (visionReqCount % DESCRIBE_EVERY === 0);
+      const url = SPARK_DETECT_URL + (describe ? "?describe=true" : "?describe=false");
+
+      const fd = new FormData();
+      fd.append("file", blob, "frame.jpg");
+
+      const resp = await fetch(url, { method: "POST", body: fd });
+      if (resp.ok) {
+        const data = await resp.json();
+        lastBoxes = data.boxes || [];
+        drawBoxes(lastBoxes);
+        document.getElementById("vision-fps").textContent = data.fps + " fps";
+        document.getElementById("vision-inf").textContent = data.inference_ms + "ms";
+        document.getElementById("vision-dot").className = "on";
+      }
+    }
+  } catch(e) {
+    document.getElementById("vision-dot").className = "err";
+  }
+
+  const elapsed = performance.now() - t0;
+  const delay = Math.max(10, VISION_INTERVAL - elapsed);
+  if (visionEnabled) visionTimer = setTimeout(visionLoop, delay);
+}
+
+// Capture frame z Agora <video> elementu do JPEG Blob
+function captureVideoFrame() {
+  return new Promise(resolve => {
+    const videoContainer = document.getElementById("front-video");
+    const video = videoContainer ? videoContainer.querySelector("video") : null;
+    if (!video || video.videoWidth === 0) { resolve(null); return; }
+
+    // Syncronizuj veľkosť canvas s video elementom
+    const canvas = document.getElementById("vision-canvas");
+    const cambox = document.getElementById("cambox-front");
+    canvas.width  = cambox.offsetWidth;
+    canvas.height = cambox.offsetHeight;
+
+    // Offscreen canvas pre capture (nie vision canvas)
+    const offscreen = document.createElement("canvas");
+    offscreen.width  = video.videoWidth;
+    offscreen.height = video.videoHeight;
+    offscreen.getContext("2d").drawImage(video, 0, 0);
+    offscreen.toBlob(blob => resolve(blob), "image/jpeg", 0.82);
+  });
+}
+
+// Nakresli boxy na vision canvas
+function drawBoxes(boxes) {
+  const canvas = document.getElementById("vision-canvas");
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!boxes || boxes.length === 0) return;
+
+  // Zisti skutočné rozmery videa (Agora môže meniť aspect ratio)
+  const videoContainer = document.getElementById("front-video");
+  const video = videoContainer ? videoContainer.querySelector("video") : null;
+  if (!video || video.videoWidth === 0) return;
+
+  // Scale faktor: video je v cambox center-cropped cez object-fit:cover
+  // Musíme namapovať video súradnice na canvas súradnice
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cw = canvas.width,     ch = canvas.height;
+  const scale = Math.max(cw / vw, ch / vh);
+  const offX  = (cw - vw * scale) / 2;
+  const offY  = (ch - vh * scale) / 2;
+
+  const now = Date.now();
+
+  boxes.forEach(box => {
+    // Transformuj súradnice z video priestoru do canvas priestoru
+    const x = offX + box.x * scale;
+    const y = offY + box.y * scale;
+    const w = box.w * scale;
+    const h = box.h * scale;
+
+    const color  = box.color || "#ffaa44";
+    const trend  = box.trend || "stable";
+    const conf   = Math.round(box.confidence * 100);
+    const label  = box.label;
+    const desc   = box.description && box.description !== label
+                   ? box.description : null;
+
+    // Pulz pre approaching – sínusový alpha efekt
+    let alpha = 1.0;
+    let lineW = 2;
+    let glowColor = null;
+
+    if (trend === "approaching") {
+      const pulse = 0.6 + 0.4 * Math.sin(now / 250);
+      alpha = pulse;
+      lineW = 2.5;
+      glowColor = "#ff4444";
+    } else if (trend === "receding") {
+      alpha = 0.55;
+      lineW = 1.5;
+    }
+
+    ctx.globalAlpha = alpha;
+
+    // Glow efekt pre approaching
+    if (glowColor) {
+      ctx.shadowColor = glowColor;
+      ctx.shadowBlur  = 12;
+    } else {
+      ctx.shadowBlur = 0;
+    }
+
+    // Hlavný rámček
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = lineW;
+    ctx.strokeRect(x, y, w, h);
+
+    // Rohové akcenty (L-tvar v každom rohu) – dáva to "tech" look
+    const cs = Math.min(w, h, 18);
+    ctx.lineWidth = lineW + 1;
+    ctx.beginPath();
+    // ľavý horný
+    ctx.moveTo(x, y + cs); ctx.lineTo(x, y); ctx.lineTo(x + cs, y);
+    // pravý horný
+    ctx.moveTo(x + w - cs, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + cs);
+    // ľavý dolný
+    ctx.moveTo(x, y + h - cs); ctx.lineTo(x, y + h); ctx.lineTo(x + cs, y + h);
+    // pravý dolný
+    ctx.moveTo(x + w - cs, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - cs);
+    ctx.stroke();
+
+    ctx.shadowBlur  = 0;
+    ctx.globalAlpha = 1.0;
+
+    // Label box – pozadia pre čitateľnosť
+    const fontSize = Math.max(10, Math.min(13, w / 8));
+    ctx.font = `bold ${fontSize}px 'Courier New', monospace`;
+
+    const mainText = `${label} ${conf}%`;
+    const trendIcon = trend === "approaching" ? " ▲" : trend === "receding" ? " ▼" : "";
+    const line1 = mainText + trendIcon;
+    const line2 = desc;
+
+    const textW = Math.max(
+      ctx.measureText(line1).width,
+      line2 ? ctx.measureText(line2).width : 0
+    ) + 10;
+    const textH = line2 ? fontSize * 2 + 10 : fontSize + 8;
+    const ty = y > textH + 4 ? y - textH - 2 : y + 2;
+
+    // Pozadie labelu
+    ctx.fillStyle = "rgba(0,0,0,0.72)";
+    ctx.fillRect(x, ty, textW, textH);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x, ty, textW, textH);
+
+    // Text – label + confidence + trend šípka
+    ctx.fillStyle = color;
+    ctx.fillText(line1, x + 5, ty + fontSize + 1);
+
+    // Popis od LLaVA (menší, svetlejší)
+    if (line2) {
+      ctx.font = `${fontSize - 1}px 'Courier New', monospace`;
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.fillText(line2, x + 5, ty + fontSize * 2 + 3);
+    }
+  });
+}
+
+// Animačná slučka pre pulzovanie (requestAnimationFrame)
+// – samostatná od fetch loopy, aby bol pulz plynulý
+function visionAnimFrame() {
+  if (visionEnabled && lastBoxes.length > 0) drawBoxes(lastBoxes);
+  if (visionEnabled) requestAnimationFrame(visionAnimFrame);
+}
+
+// Resize: ak sa zmení veľkosť okna, uprav canvas
+window.addEventListener("resize", () => {
+  const canvas = document.getElementById("vision-canvas");
+  const cambox = document.getElementById("cambox-front");
+  if (canvas && cambox) {
+    canvas.width  = cambox.offsetWidth;
+    canvas.height = cambox.offsetHeight;
+    if (visionEnabled && lastBoxes.length > 0) drawBoxes(lastBoxes);
+  }
+});
+</script>
+</body>
+</html>

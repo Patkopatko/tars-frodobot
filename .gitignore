@@ -1,0 +1,14 @@
+.DS_Store
+.env
+*.env
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+node_modules/
+screenshots/*.png
+screenshots/*.jpg
+screenshots/*.webp
+
+earth-rovers-sdk.zip
