@@ -652,6 +652,7 @@ function updateKeysUI() {
 // ══════════════════════════════════════════════════════════════════
 let rtmClient  = null;
 let rtmChannel = null;
+let rtmReconnecting = false;
 
 async function joinRTM() {
   try {
@@ -668,13 +669,35 @@ async function joinRTM() {
       } catch(e) {}
     });
 
+    // Auto-reconnect keď RTM spadne
+    rtmClient.on("ConnectionStateChanged", (state, reason) => {
+      if (state === "DISCONNECTED" || state === "ABORTED") {
+        rtmChannel = null;
+        document.getElementById("connect-status").textContent = "RTM: odpojený, rekonektujem...";
+        if (!rtmReconnecting) {
+          rtmReconnecting = true;
+          setTimeout(async () => {
+            rtmReconnecting = false;
+            await joinRTM();
+          }, 2000);
+        }
+      } else if (state === "CONNECTED") {
+        rtmChannel = rtmClient;
+        document.getElementById("connect-status").textContent = "Agora: CONNECTED + RTM OK";
+      }
+    });
+
     await rtmClient.login({ token: RTM_TOKEN, uid: String(UID) });
-    rtmChannel = rtmClient; // označíme že RTM je ready
+    rtmChannel = rtmClient;
     console.log("RTM login OK, bot UID:", BOT_RTM_UID);
     document.getElementById("connect-status").textContent = "Agora: CONNECTED + RTM OK";
   } catch(e) {
     console.warn("RTM login failed:", e);
     rtmChannel = null;
+    if (!rtmReconnecting) {
+      rtmReconnecting = true;
+      setTimeout(async () => { rtmReconnecting = false; await joinRTM(); }, 3000);
+    }
   }
 }
 
@@ -816,6 +839,8 @@ async function visionLoop() {
 
   const elapsed = performance.now() - t0;
   const delay = Math.max(10, VISION_INTERVAL - elapsed);
+  // Obnov fokus po fetchi — fetch môže ukradnúť fokus vo Firefoxe
+  if (document.activeElement !== document.body) document.body.focus();
   if (visionEnabled) visionTimer = setTimeout(visionLoop, delay);
 }
 
@@ -871,12 +896,21 @@ function drawBoxes(boxes) {
     const w = box.w * scale;
     const h = box.h * scale;
 
-    const color  = box.color || "#ffaa44";
     const trend  = box.trend || "stable";
     const conf   = Math.round(box.confidence * 100);
     const label  = box.label;
     const desc   = box.description && box.description !== label
                    ? box.description : null;
+    const depthM = box.depth_m != null ? box.depth_m : null;
+
+    // Farba rámčeka: ak máme depth → podľa vzdialenosti, inak podľa kategórie
+    let color = box.color || "#ffaa44";
+    if (depthM != null) {
+      if (depthM < 1.0)      color = "#ff4444"; // červená — menej ako 1m
+      else if (depthM < 2.5) color = "#ffaa44"; // oranžová — 1–2.5m
+      else if (depthM < 5.0) color = "#44ff88"; // zelená — 2.5–5m
+      else                   color = "#4488ff"; // modrá — viac ako 5m
+    }
 
     // Pulz pre approaching – sínusový alpha efekt
     let alpha = 1.0;
@@ -929,7 +963,8 @@ function drawBoxes(boxes) {
     const fontSize = Math.max(10, Math.min(13, w / 8));
     ctx.font = `bold ${fontSize}px 'Courier New', monospace`;
 
-    const mainText = `${label} ${conf}%`;
+    const depthStr = depthM != null ? ` | ${depthM}m` : "";
+    const mainText = `${label} ${conf}%${depthStr}`;
     const trendIcon = trend === "approaching" ? " ▲" : trend === "receding" ? " ▼" : "";
     const line1 = mainText + trendIcon;
     const line2 = desc;
