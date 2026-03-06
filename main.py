@@ -772,6 +772,76 @@ async def end_intervention(request: Request):
         )
 
 
+# ── TARS ROBOT STATE API ─────────────────────────────────────────────────────
+# State bridge medzi TARS OpenClaw a dashboardom.
+# TARS posiela príkazy cez tieto endpointy (Telegram/WhatsApp → OpenClaw → tu).
+# Dashboard polling /robot/state každé 2s a vykonáva príkazy.
+
+_robot_state: dict = {
+    "explorer": False,
+    "last_scene": None,
+    "last_scene_ts": None,
+}
+
+
+class ExploreRequest(BaseModel):
+    enabled: bool
+
+
+class SceneData(BaseModel):
+    boxes: list
+    explorer_state: str = ""
+
+
+@app.get("/robot/state")
+async def get_robot_state():
+    """Aktuálny stav robota – dashboard ho polling-uje každé 2s."""
+    return JSONResponse(content=_robot_state)
+
+
+@app.post("/robot/explore")
+async def set_explorer(req: ExploreRequest):
+    """Zapni/vypni autonomous explorer. TARS volá toto cez OpenClaw skill."""
+    _robot_state["explorer"] = req.enabled
+    return {"ok": True, "explorer": _robot_state["explorer"]}
+
+
+@app.post("/robot/stop")
+async def robot_stop():
+    """Núdzové zastavenie – vypne explorer a pošle stop RTM príkaz."""
+    _robot_state["explorer"] = False
+    if auth_response_data:
+        try:
+            cmd = {"linear": 0, "angular": 0, "lamp": 0}
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: RtmClient(auth_response_data).send_message_to_bot(cmd)
+            )
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@app.post("/robot/scene")
+async def post_scene(req: SceneData):
+    """Dashboard sem posiela detekcie po každom vision frame (YOLO výsledky)."""
+    _robot_state["last_scene"] = {
+        "boxes": req.boxes,
+        "explorer_state": req.explorer_state,
+    }
+    _robot_state["last_scene_ts"] = datetime.utcnow().isoformat()
+    return {"ok": True}
+
+
+@app.get("/robot/scene")
+async def get_scene():
+    """Vráti posledné detekcie z TARS VISION. TARS sa pýta: čo robot vidí?"""
+    return JSONResponse(content={
+        "scene": _robot_state["last_scene"],
+        "timestamp": _robot_state["last_scene_ts"],
+    })
+
+
 @app.get("/interventions/history")
 async def interventions_history():
     auth_header = os.getenv("SDK_API_TOKEN")

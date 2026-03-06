@@ -808,6 +808,12 @@ function explorerToggle() {
     setExplorerUI("off", "OFF");
     setStatus("■ STOJÍ", "");
   }
+  // Sync stavu s SDK serverom (TARS môže čítať/meniť cez /robot/explore)
+  fetch("/robot/explore", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ enabled: explorerEnabled })
+  }).catch(() => {});
 }
 
 function setExplorerUI(cls, label) {
@@ -975,6 +981,8 @@ async function visionLoop() {
         document.getElementById("vision-fps").textContent = data.fps + " fps";
         document.getElementById("vision-inf").textContent = data.inference_ms + "ms";
         document.getElementById("vision-dot").className = "on";
+        // Post scene to SDK → TARS môže čítať cez GET /robot/scene
+        postSceneToSDK(lastBoxes);
       }
     }
   } catch(e) {
@@ -1146,6 +1154,43 @@ function visionAnimFrame() {
   if (visionEnabled && lastBoxes.length > 0) drawBoxes(lastBoxes);
   if (visionEnabled) requestAnimationFrame(visionAnimFrame);
 }
+
+// ══════════════════════════════════════════════════════════════════
+//  TARS ROBOT STATE API  –  state bridge medzi dashboardom a TARS
+//
+//  TARS (OpenClaw cez Telegram/WhatsApp) posiela príkazy cez SDK endpointy.
+//  Dashboard ich polling-uje každé 2s a synchronizuje lokálny stav.
+//
+//  Endpointy:
+//    GET  /robot/state   → { explorer, last_scene, last_scene_ts }
+//    POST /robot/explore → { enabled: bool }
+//    POST /robot/stop    → emergency stop
+//    GET  /robot/scene   → posledné YOLO detekcie
+//    POST /robot/scene   → dashboard tu posiela detekcie po každom frame
+// ══════════════════════════════════════════════════════════════════
+
+async function postSceneToSDK(boxes) {
+  try {
+    await fetch("/robot/scene", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ boxes, explorer_state: explorerState })
+    });
+  } catch(e) {}
+}
+
+async function pollRobotState() {
+  try {
+    const r = await fetch("/robot/state");
+    if (!r.ok) return;
+    const s = await r.json();
+    // Ak TARS vzdialene zmenil explorer stav, syncronizuj
+    if (s.explorer !== explorerEnabled) {
+      explorerToggle();
+    }
+  } catch(e) {}
+}
+setInterval(pollRobotState, 2000);
 
 // Resize: ak sa zmení veľkosť okna, uprav canvas
 window.addEventListener("resize", () => {
