@@ -971,7 +971,7 @@ async function visionLoop() {
       fd.append("file", blob, "frame.jpg");
 
       const ctrl = new AbortController();
-      const fetchTimeout = setTimeout(() => ctrl.abort(), 3000); // 3s timeout
+      const fetchTimeout = setTimeout(() => ctrl.abort(), 8000); // 8s timeout (Spark môže byť pomalší)
       const resp = await fetch(url, { method: "POST", body: fd, signal: ctrl.signal });
       clearTimeout(fetchTimeout);
       if (resp.ok) {
