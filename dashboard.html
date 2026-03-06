@@ -195,6 +195,7 @@ kbd {
      ══════════════════════════════════════════ -->
 <div id="topbar">
   <h1>⬡ FRODOBOT</h1>
+  <span style="font-size:9px;color:#555;letter-spacing:1px" id="session-ts">SES {{ session_ts }}</span>
 
   <!-- Agora RTC connection status (dot + text) -->
   <div class="stat">
@@ -358,6 +359,7 @@ const RTM_TOKEN   = "{{ rtm_token }}"; // RTM token pre ovládanie
 const CHANNEL     = "{{ channel }}";   // napr. "ride_bot_frodobot_pkjmes"
 const UID         = Number("{{ uid }}"); // náš user ID v Agora kanáli
 const BOT_RTM_UID = "{{ bot_uid }}";   // UID robota v RTM (napr. frodobot_pkjmes)
+const SESSION_TS  = "{{ session_ts }}"; // čas načítania tokenu zo servera
 
 // Fixné UID botových kamerastreams v Agora kanáli
 const BOT_UID_FRONT = 1000;  // predná kamera

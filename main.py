@@ -378,6 +378,8 @@ async def dashboard(request: Request):
     if not auth_response_data:
         await auth_common()
 
+    session_ts = datetime.now().strftime("%H:%M:%S")
+
     template_vars = {
         "appid": auth_response_data.get("APP_ID", ""),
         "rtc_token": auth_response_data.get("RTC_TOKEN", ""),
@@ -386,6 +388,7 @@ async def dashboard(request: Request):
         "uid": auth_response_data.get("USERID", ""),
         "bot_uid": auth_response_data.get("BOT_UID", ""),
         "bot_type": auth_response_data.get("BOT_TYPE", "mini"),
+        "session_ts": session_ts,
     }
 
     with open("dashboard.html", "r", encoding="utf-8") as f:
@@ -394,7 +397,11 @@ async def dashboard(request: Request):
     for key, value in template_vars.items():
         html = html.replace(f"{{{{ {key} }}}}", str(value))
 
-    return HTMLResponse(content=html, status_code=200)
+    return HTMLResponse(
+        content=html,
+        status_code=200,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 @app.post("/control-legacy")
