@@ -495,6 +495,7 @@ function getCmd() {
 // Hlavná riadiaca slučka – každých 100ms odošle aktuálny príkaz
 // (10 Hz je štandardná frekvencia pre robotické ovládanie)
 cmdInterval = setInterval(() => {
+  if (explorerEnabled) return; // explorer riadi pohyb sám
   const { lin, ang } = getCmd();
   sendCmd(lin, ang);
   // Aktualizácia statusu pohybu v bottom bare
@@ -780,11 +781,11 @@ document.body.addEventListener("blur", () => {
 //    - Ak depth_m chýba (Spark nedostupný) → robot stojí
 // ══════════════════════════════════════════════════════════════════
 
-const OBSTACLE_DEPTH   = 1.5;   // m — bližšie ako toto = prekážka
-const EXPLORER_SPEED   = 0.18;  // linear pri voľnej ceste
+const OBSTACLE_DEPTH   = 2.5;   // m — bližšie ako toto = prekážka (väčší buffer)
+const EXPLORER_SPEED   = 0.10;  // linear pri voľnej ceste (pomalšie = bezpečnejšie)
 const AVOID_ANGULAR    = 0.35;  // angular pri vyhýbaní
-const OBSTACLE_ZONE    = 0.30;  // stred framu ±30% = nebezpečná zóna
-const MAX_AVOID_MS     = 2500;  // ms — po tomto čase flip smeru otáčania
+const OBSTACLE_ZONE    = 0.50;  // stred framu ±50% = celá šírka framu
+const MAX_AVOID_MS     = 10000; // ms — celá rotácia ~360° pred flipom smeru
 
 let explorerEnabled   = false;
 let explorerTimer     = null;
@@ -824,11 +825,17 @@ function getObstacle() {
   const fw = video.videoWidth;
   const lo = fw * (0.5 - OBSTACLE_ZONE);
   const hi = fw * (0.5 + OBSTACLE_ZONE);
+
   let closest = null;
   for (const box of lastBoxes) {
-    if (box.depth_m == null || box.depth_m >= OBSTACLE_DEPTH) continue;
+    if (box.depth_m == null) continue;
     const cx = box.x + box.w / 2;
-    if (cx >= lo && cx <= hi) {
+    // Hlavná zóna — priama prekážka
+    if (cx >= lo && cx <= hi && box.depth_m < OBSTACLE_DEPTH) {
+      if (!closest || box.depth_m < closest.depth_m) closest = box;
+    }
+    // Bočné objekty veľmi blízko — naznačujú úzku chodbu alebo roh
+    if (box.depth_m < 0.8) {
       if (!closest || box.depth_m < closest.depth_m) closest = box;
     }
   }
@@ -957,7 +964,10 @@ async function visionLoop() {
       const fd = new FormData();
       fd.append("file", blob, "frame.jpg");
 
-      const resp = await fetch(url, { method: "POST", body: fd });
+      const ctrl = new AbortController();
+      const fetchTimeout = setTimeout(() => ctrl.abort(), 3000); // 3s timeout
+      const resp = await fetch(url, { method: "POST", body: fd, signal: ctrl.signal });
+      clearTimeout(fetchTimeout);
       if (resp.ok) {
         const data = await resp.json();
         lastBoxes = data.boxes || [];
