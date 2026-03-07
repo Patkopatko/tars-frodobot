@@ -367,6 +367,21 @@ async def get_index(request: Request):
     return await render_index_html(is_spectator=True)
 
 
+@app.get("/token/refresh")
+async def token_refresh():
+    """Vrati cerstve Agora tokeny bez reloadu stranky.
+    Dashboard to vola automaticky ked RTC/RTM token expiruje."""
+    await auth_common()
+    return JSONResponse(content={
+        "rtc_token": auth_response_data.get("RTC_TOKEN", ""),
+        "rtm_token": auth_response_data.get("RTM_TOKEN", ""),
+        "appid":     auth_response_data.get("APP_ID", ""),
+        "channel":   auth_response_data.get("CHANNEL_NAME", ""),
+        "uid":       auth_response_data.get("USERID", ""),
+        "bot_uid":   auth_response_data.get("BOT_UID", ""),
+    })
+
+
 @app.get("/sdk")
 async def sdk(request: Request):
     return await render_index_html(is_spectator=False)

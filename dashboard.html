@@ -441,6 +441,45 @@ async function joinChannel() {
   }
 }
 
+
+// ── AUTO TOKEN REFRESH ───────────────────────────────────────────────────────
+// Agora vola 30s pred expiraciou a pri uplnej expiracji.
+// Ticho obnovime token zo servera a rejoinujeme — bez reloadu stranky.
+
+async function fetchFreshTokens() {
+  const r = await fetch("/token/refresh");
+  if (!r.ok) throw new Error("token/refresh HTTP " + r.status);
+  return await r.json();
+}
+
+client.on("token-privilege-will-expire", async () => {
+  console.log("[RTC] Token expiruje za 30s, obnova...");
+  try {
+    const d = await fetchFreshTokens();
+    await client.renewToken(d.rtc_token);
+    console.log("[RTC] Token obnoveny (renewToken)");
+    setConnStatus("CONNECTED", true);
+  } catch(e) { console.warn("[RTC] renewToken zlyhal:", e); }
+});
+
+client.on("token-privilege-did-expire", async () => {
+  console.log("[RTC] Token expirovany, rejoin...");
+  setConnStatus("obnova tokenu...", false);
+  document.getElementById("conn-v").textContent = "OBNOVA";
+  try {
+    const d = await fetchFreshTokens();
+    try { await client.leave(); } catch(_) {}
+    await client.join(APPID, d.channel, d.rtc_token, UID || null);
+    setConnStatus("CONNECTED", true);
+    setStatus("■ STOJI", "");
+    console.log("[RTC] Rejoin OK — novy token");
+  } catch(e) {
+    console.error("[RTC] Rejoin zlyhal:", e);
+    setConnStatus("ERR: token refresh zlyhal", false);
+    document.getElementById("rtc-retry-btn").style.display = "inline";
+  }
+});
+
 async function retryRTC() {
   document.getElementById("rtc-retry-btn").style.display = "none";
   document.getElementById("connect-status").style.color = "";
@@ -700,6 +739,17 @@ async function joinRTM() {
         rtmChannel = rtmClient;
         document.getElementById("connect-status").textContent = "Agora: CONNECTED + RTM OK";
       }
+    });
+
+
+    // RTM token expiry — ticho obnovime token
+    rtmClient.on("TokenExpired", async () => {
+      console.log("[RTM] Token expirovany, obnova...");
+      try {
+        const d = await fetchFreshTokens();
+        await rtmClient.renewToken(d.rtm_token);
+        console.log("[RTM] Token obnoveny");
+      } catch(e) { console.warn("[RTM] Token refresh zlyhal:", e); }
     });
 
     await rtmClient.login({ token: RTM_TOKEN, uid: String(UID) });
