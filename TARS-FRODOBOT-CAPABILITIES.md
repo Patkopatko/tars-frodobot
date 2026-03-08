@@ -30,6 +30,8 @@
 | S-10 | TARS EXPLORER — autonomna exploracia | E | OK |
 | S-11 | Vyhybanie sa prekazkam | automaticky (Explorer) | OK |
 | S-12 | Robot State API (vzdialene ovladanie) | REST endpoints | OK |
+| S-13 | OCR — citanie textu a znaciek | automaticky (Vision) | OK — neoverene |
+| S-14 | Auto token refresh (Agora) | automaticky | OK |
 
 ---
 
@@ -336,4 +338,67 @@ http://localhost:8001/dashboard
 
 ---
 
-Dokument: 2026-03-07 | TARS FRODOBOT v2.0
+---
+
+## S-13 — OCR — citanie textu a znaciek
+
+Real-time rozpoznavanie textu z kamery. Funguje na svietiacich znackach, nalepkach, tabuliach.
+
+**Model:** EasyOCR (en + cs), GPU akceleracia na NVIDIA GB10 Blackwell
+**Frekvencia:** Kazdy 3. frame (nebrzdí YOLO pipeline)
+**Vizual:** Cyan ramcek (#00ffff) — odliseny od YOLO boxov
+
+**Parametre:**
+
+| Parameter | Hodnota | Popis |
+|-----------|---------|-------|
+| Jazyky | en, cs | Anglictina + cestina |
+| Min. konfidencia | 0.45 | Pod touto hodnotou ignoruj |
+| Min. dlzka textu | 2 znaky | Filtruje jednotlive pismena/sum |
+| Min. velkost boxu | 10x8 px | Filtruje mikroskopicky sum |
+| Interval | kazdy 3. frame | Vykon vs. presnost |
+
+**Vystup:** `{ source: "ocr", label: "365", color: "#00ffff", depth_m: X.X }`
+
+**Pipeline:**
+```
+Frame -> YOLO11x (objekty) + EasyOCR (text) [paralelne]
+      -> Depth Anything V2 (vzdialenost pre oba typy boxov)
+      -> Dashboard: YOLO boxy (farebne) + OCR boxy (cyan)
+```
+
+**Priklad:** Svietiaci znak "365" -> cyan ramcek s labelom "365" + vzdialenost v metroch
+
+**Stav:** Implementovane, caka na overenie so skutocnou znackou.
+
+---
+
+## S-14 — Auto token refresh (Agora)
+
+Automaticka obnova Agora tokenov bez reloadu stranky alebo restartu SDK.
+
+**Problem predtym:** Agora token expiruje ~24h -> cierne kamery, RTC ERR -> nutny restart SDK + novy tab
+**Teraz:** Dashboard ticho obnovi token a rejoinuje automaticky
+
+**SDK endpoint:** `GET /token/refresh` — vrati cerstve RTC + RTM tokeny
+
+**Tok:**
+- **30s pred expiraciou** -> `token-privilege-will-expire` -> `client.renewToken()` (plynule, bez odpojenia)
+- **Po expiraci** -> `token-privilege-did-expire` -> `leave()` + `join()` s novym tokenom (2-3s vypadok kamery)
+- **RTM token** -> `TokenExpired` -> `rtmClient.renewToken()` (ovladanie neprestane)
+
+---
+
+## Roadmapa
+
+| # | Faza | Nazov | Popis |
+|---|------|-------|-------|
+| F-03 | Faza 3 | LLaVA Scene Feed | Celkovy popis sceny kazde 2-3s ako text overlay v dashboarde |
+| F-04 | Faza 4 | TensorRT optimalizacia | 300+ FPS inferencia na GB10 Blackwell |
+| F-05 | Faza 5 | Depth pre prazdne steny | Center-forward depth bez bbox zavislosti — detekovanie sten |
+| F-06 | Faza 6 | Visual Servoing | goto?target=chair — najdi objekt a pribliz sa k nemu |
+| F-07 | Faza 7 | OpenClaw FrodoBot skill | Plna integracia: Telegram/WhatsApp -> robot |
+
+---
+
+Dokument: 2026-03-08 | TARS FRODOBOT v2.1
